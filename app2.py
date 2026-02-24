@@ -11,9 +11,9 @@ def format_vnd(amount):
     return "{:,.0f} ₫".format(amount).replace(",", ".")
 
 # --- 2. PAGE CONFIG ---
-st.set_page_config(page_title="Emergency Fund AI Coach", layout="wide")
+st.set_page_config(page_title="Emergency Fund Calculator", layout="wide")
 
-st.title("🛡️ Smart Emergency Fund AI Coach")
+st.title("🛡️ Smart Emergency Fund Calculator")
 
 # --- 3. CALLBACKS FOR SYNCHRONIZATION ---
 def update_slider(key_input, key_slider):
@@ -138,15 +138,35 @@ if run_calc:
             st.plotly_chart(fig_growth, use_container_width=True)
 
         with col_coach:
-            st.subheader("🤝 AI Coach Interpretation")
-            if reached_s2 is not None: st.success(f"✅ S2 (Adequate): Reached at Month {reached_s2}")
-            if reached_s3 is not None: 
-                st.success(f"🚀 S3 (Strong): Reached at Month {reached_s3}")
-                st.info("**Advice:** You've reached full security. Maintain this habits.")
+            st.subheader("🤝 Interpretation")
+            
+            # Milestone calculation targets based on your 5-state framework
+            s1_t, s2_t, s3_t, s4_t, s5_t = target_total * 0.25, target_total * 0.50, target_total * 0.75, target_total, target_total
+            
+            # Variables to track when each state is first reached
+            reached = { "S2": None, "S3": None, "S4": None, "S5": None }
+            
+            # Re-check the history to find exact months for all 5 states
+            for row in history_bal:
+                bal = row["Balance"]
+                m = row["Month"]
+                if reached["S2"] is None and bal >= s1_t: reached["S2"] = m
+                if reached["S3"] is None and bal >= s2_t: reached["S3"] = m
+                if reached["S4"] is None and bal >= s3_t: reached["S4"] = m
+                if reached["S5"] is None and bal >= s4_t: reached["S5"] = m
+
+            # Display Milestones
+            if reached["S2"] is not None: st.write(f"🔸 **S2 (Emerging):** Month {reached['S2']}")
+            if reached["S3"] is not None: st.write(f"🔸 **S3 (Resilient):** Month {reached['S3']}")
+            if reached["S4"] is not None: st.write(f"🔸 **S4 (Secure):** Month {reached['S4']}")
+            
+            if reached["S5"] is not None:
+                st.success(f"🚀 **S5 (Optimal):** Reached at Month {reached['S5']}")
+                st.info("**Advice:** You have achieved 100% of your target. Your long-term focus should now shift to capital growth.")
             elif monthly_savings > 0:
-                st.warning("⚠️ **S3 Target:** Not reached within projection. Consider increasing savings.")
+                st.warning("⚠️ **Target S5:** Not reached within 24 months. To improve your 'Upward Probability', consider increasing monthly savings.")
             else:
-                st.error("🛑 **No Growth:** Savings are 0. Goal is unreachable.")
+                st.error("🛑 **Debt Trap Risk:** With 0 savings, the Markov model shows a 100% probability of sliding back to S1 if a shock occurs.")
 
     # 5.3 MARKOV LOGIC (5-State Paper Framework)
     st.divider()

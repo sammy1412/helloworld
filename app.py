@@ -11,9 +11,9 @@ def format_vnd(amount):
     return "{:,.0f} ₫".format(amount).replace(",", ".")
 
 # --- 2. PAGE CONFIG ---
-st.set_page_config(page_title="Emergency Fund AI Coach", layout="wide")
+st.set_page_config(page_title="Emergency Fund Calculator", layout="wide")
 
-st.title("🛡️ Smart Emergency Fund AI Coach")
+st.title("🛡️ Smart Emergency Fund Calculator")
 
 # --- 3. CALLBACKS FOR SYNCHRONIZATION ---
 def update_slider(key_input, key_slider):
@@ -144,7 +144,7 @@ if run_calc:
             st.plotly_chart(fig_growth, use_container_width=True)
 
         with col_coach:
-            st.subheader("🤝 AI Coach Interpretation")
+            st.subheader("Interpretation")
             st.write(f"**Current Balance:** {format_vnd(current_bal)}")
             st.write(f"**Monthly Savings:** {format_vnd(monthly_savings)}")
             
