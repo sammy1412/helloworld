@@ -193,4 +193,4 @@ if run_calc:
 
 else:
     # DISPLAY WHEN NO BUTTON IS PRESSED
-    st.info("👈 Please enter your financial details in the sidebar and click 'Calculate Analysis' to begin.")
+    st.info("Please enter your financial details in the sidebar and click 'Calculate Analysis' to begin.")
