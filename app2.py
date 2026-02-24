@@ -11,9 +11,9 @@ def format_vnd(amount):
     return "{:,.0f} ₫".format(amount).replace(",", ".")
 
 # --- 2. PAGE CONFIG ---
-st.set_page_config(page_title="Emergency Fund Calculator", layout="wide")
+st.set_page_config(page_title="Emergency Fund Adequate Calculator", layout="wide")
 
-st.title("🛡️ Smart Emergency Fund Calculator")
+st.title("Smart Emergency Fund Adequate Calculator")
 
 # --- 3. CALLBACKS FOR SYNCHRONIZATION ---
 def update_slider(key_input, key_slider):
@@ -68,6 +68,9 @@ with st.sidebar:
 
 # --- 5. MAIN CONTENT AREA ---
 if run_calc:
+    # GLOBAL TARGET DEFINITION (Prevents NameError)
+    target_total = e_basic * 6
+
     # 5.1 SUMMARY
     st.header("📝 Summary of Your Financial Profile")
     col_s1, col_s2, col_s3 = st.columns([1, 1, 1.5])
@@ -93,39 +96,45 @@ if run_calc:
             fig_pie.update_layout(height=250, margin=dict(l=0, r=0, t=30, b=0))
             st.plotly_chart(fig_pie, use_container_width=True)
 
-    # 5.2 STRATEGIC ROADMAP (FIXED ACCUMULATION BUG)
+    # 5.2 ROADMAP
     st.divider()
     st.header("🎯 Strategic Wealth Roadmap & Interpretation")
 
     if e_basic > 0:
-        s2_target = e_basic * 3
-        s3_target = e_basic * 6
         monthly_interest = (rate_earn / 100) / 12
-        
         max_limit = 120
         months_display = 24
         
-        # Determine how many months to show
+        # Determine projection length
         if monthly_savings > 0:
             temp_calc = current_bal
             for m in range(max_limit + 1):
-                if temp_calc >= s3_target:
+                if temp_calc >= target_total:
                     months_display = max(24, m)
                     break
                 temp_calc = (temp_calc + monthly_savings) * (1 + monthly_interest)
 
+        # 5-State Thresholds (increments of 25% of the 6-month goal)
+        s2_t = target_total * 0.25
+        s3_t = target_total * 0.50
+        s4_t = target_total * 0.75
+        s5_t = target_total
+        
         history_bal = []
-        current_temp = current_bal # FIX: Start with actual current balance
-        reached_s2, reached_s3 = None, None
+        current_temp = current_bal
+        reached = { "S2": None, "S3": None, "S4": None, "S5": None }
         
         for m in range(months_display + 1):
-            color_status = "Secure" if current_temp >= s2_target else "Inadequate"
+            color_status = "Secure" if current_temp >= s5_t else "Inadequate"
             history_bal.append({"Month": m, "Balance": current_temp, "Status": color_status})
             
-            if reached_s2 is None and current_temp >= s2_target: reached_s2 = m
-            if reached_s3 is None and current_temp >= s3_target: reached_s3 = m
+            # Identify month of crossing for each state transition
+            if reached["S2"] is None and current_temp >= s2_t: reached["S2"] = m
+            if reached["S3"] is None and current_temp >= s3_t: reached["S3"] = m
+            if reached["S4"] is None and current_temp >= s4_t: reached["S4"] = m
+            if reached["S5"] is None and current_temp >= s5_t: reached["S5"] = m
             
-            # FIX: Properly accumulate balance for the next month in the loop
+            # Accumulate for next month
             current_temp = (current_temp + monthly_savings) * (1 + monthly_interest)
         
         df_growth = pd.DataFrame(history_bal)
@@ -133,53 +142,35 @@ if run_calc:
         
         with col_plot:
             fig_growth = px.bar(df_growth, x="Month", y="Balance", title=f"Accumulation Projection ({months_display} Months)", color="Status", color_discrete_map={"Inadequate": "#EF553B", "Secure": "#00CC96"})
-            fig_growth.add_hline(y=s2_target, line_dash="dash", line_color="black", annotation_text="S2 Target")
-            fig_growth.add_hline(y=s3_target, line_dash="dash", line_color="black", annotation_text="S3 Target")
+            # Add all state threshold lines
+            for t, label in zip([s2_t, s3_t, s4_t, s5_t], ["S2 (25%)", "S3 (50%)", "S4 (75%)", "S5 (Goal)"]):
+                fig_growth.add_hline(y=t, line_dash="dash", line_color="black", annotation_text=label)
             st.plotly_chart(fig_growth, use_container_width=True)
 
         with col_coach:
-            st.subheader("🤝 Interpretation")
-            
-            # Milestone calculation targets based on your 5-state framework
-            s1_t, s2_t, s3_t, s4_t, s5_t = target_total * 0.25, target_total * 0.50, target_total * 0.75, target_total, target_total
-            
-            # Variables to track when each state is first reached
-            reached = { "S2": None, "S3": None, "S4": None, "S5": None }
-            
-            # Re-check the history to find exact months for all 5 states
-            for row in history_bal:
-                bal = row["Balance"]
-                m = row["Month"]
-                if reached["S2"] is None and bal >= s1_t: reached["S2"] = m
-                if reached["S3"] is None and bal >= s2_t: reached["S3"] = m
-                if reached["S4"] is None and bal >= s3_t: reached["S4"] = m
-                if reached["S5"] is None and bal >= s4_t: reached["S5"] = m
-
-            # Display Milestones
+            st.subheader("🤝Interpretation")
             if reached["S2"] is not None: st.write(f"🔸 **S2 (Emerging):** Month {reached['S2']}")
             if reached["S3"] is not None: st.write(f"🔸 **S3 (Resilient):** Month {reached['S3']}")
             if reached["S4"] is not None: st.write(f"🔸 **S4 (Secure):** Month {reached['S4']}")
             
             if reached["S5"] is not None:
                 st.success(f"🚀 **S5 (Optimal):** Reached at Month {reached['S5']}")
-                st.info("**Advice:** You have achieved 100% of your target. Your long-term focus should now shift to capital growth.")
+                st.info("**Advice:** Goal achieved. Maintain your discipline and start investing surplus.")
             elif monthly_savings > 0:
-                st.warning("⚠️ **Target S5:** Not reached within 24 months. To improve your 'Upward Probability', consider increasing monthly savings.")
+                gap = s5_t - history_bal[-1]["Balance"]
+                st.warning(f"⚠️ **S5 Gap:** You are still **{format_vnd(gap)}** short of the goal by Month 24.")
             else:
-                st.error("🛑 **Debt Trap Risk:** With 0 savings, the Markov model shows a 100% probability of sliding back to S1 if a shock occurs.")
+                st.error("🛑 **Growth Stalled:** Zero savings detected. State S5 is currently unreachable.")
 
-    # 5.3 MARKOV LOGIC (5-State Paper Framework)
+    # 5.3 MARKOV LOGIC
     st.divider()
     st.subheader("🎲 Financial State Probability (Markov Model)")
     
-    
-
     lambda_shock = 0.073
-    states = ["S1: <25% T", "S2: 25-50% T", "S3: 50-75% T", "S4: 75-100% T", "S5: >100% T"]
-    target_total = e_basic * 6
     step_val = target_total / 4
     p_up = min(0.85, monthly_savings / step_val) if step_val > 0 else 0
     
+    # 5x5 Transition Matrix P
     P = np.zeros((5, 5))
     for i in range(5):
         if i > 0: P[i, i-1] = lambda_shock
@@ -191,24 +182,22 @@ if run_calc:
     col_m1, col_m2 = st.columns([1, 1])
     with col_m1:
         st.write("**Transition Matrix (P):**")
-        st.table(pd.DataFrame(P, index=states, columns=states).style.format("{:.1%}"))
+        st.table(pd.DataFrame(P, index=["S1", "S2", "S3", "S4", "S5"], columns=["S1", "S2", "S3", "S4", "S5"]).style.format("{:.1%}"))
         
         evals, evecs = np.linalg.eig(P.T)
         steady = evecs[:, np.isclose(evals, 1.0)].real
         steady = (steady / steady.sum()).flatten()
-        safety_prob = steady[3] + steady[4]
-        st.metric("Long-run Safety (S4+S5)", f"{safety_prob:.1%}")
-        if safety_prob < 0.85: st.error("Advice: Increase savings to improve safety.")
+        st.metric("Long-run Safety (S4+S5 Probability)", f"{(steady[3] + steady[4]):.1%}")
 
     with col_m2:
         ratio = current_bal / target_total if target_total > 0 else 0
         curr_idx = 0 if ratio < 0.25 else 1 if ratio < 0.5 else 2 if ratio < 0.75 else 3 if ratio < 1 else 4
         v = np.zeros(5); v[curr_idx] = 1
-        history = [v]
+        history_m = [v]
         for _ in range(24):
             v = np.dot(v, P)
-            history.append(v)
-        st.plotly_chart(px.area(pd.DataFrame(history, columns=states), title="24-Month Probability Forecast"), use_container_width=True)
+            history_m.append(v)
+        st.plotly_chart(px.area(pd.DataFrame(history_m, columns=["S1", "S2", "S3", "S4", "S5"]), title="24-Month Probability Forecast"), use_container_width=True)
 
 else:
     st.info("👈 Please enter your financial details in the sidebar and click 'Calculate Analysis' to begin.")
