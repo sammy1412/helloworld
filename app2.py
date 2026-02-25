@@ -2,484 +2,626 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HELPER: VND formatter
+# CORE LOGIC
 # ─────────────────────────────────────────────────────────────────────────────
-def fmt_vnd(amount):
+
+def fmt_money(amount):
     if amount is None or amount == 0:
         return "0 ₫"
     return "{:,.0f} ₫".format(amount).replace(",", ".")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CORE MODEL: Calibrated Markov Chain (Section 3 Framework)
-# ─────────────────────────────────────────────────────────────────────────────
-# The base calibrated matrix P is anchored to:
-#   λ_composite ≈ 7.3% (BLS JOLTS + CFPB MEM + Pew Charitable Trusts)
-#   Savings force: savings-rate-sensitive upward adjustment on top of base
-# Each row sums to 1.00 ✓
-BASE_P = np.array([
-    [0.550, 0.280, 0.100, 0.050, 0.020],
-    [0.120, 0.450, 0.280, 0.120, 0.030],
-    [0.040, 0.090, 0.500, 0.280, 0.090],
-    [0.010, 0.040, 0.120, 0.550, 0.280],
-    [0.005, 0.010, 0.060, 0.235, 0.690],
-], dtype=float)
+TIER_WIDTHS = [1, 2, 3, 3]
 
-def build_P(monthly_savings, target_total):
+STATE_LABELS = ["🔴 Distressed", "🟠 Fragile", "🔵 Stable", "🟢 Flourishing"]
+STATE_KEYS   = ["Distressed", "Fragile", "Stable", "Flourishing"]
+
+COLOR_MAP = {
+    "🔴 Distressed":  "#EF553B",
+    "🟠 Fragile":     "#FFA15A",
+    "🔵 Stable":      "#636EFA",
+    "🟢 Flourishing": "#00CC96",
+}
+
+STATE_DESCRIPTIONS = {
+    "🔴 Distressed":  "Your emergency fund covers less than 1 month of expenses. A single unexpected event could put you in serious financial trouble.",
+    "🟠 Fragile":     "Your fund covers 1–3 months of expenses. You have some cushion, but a major event like job loss could still wipe it out quickly.",
+    "🔵 Stable":      "Your fund covers 3–6 months of expenses. You're in a good position to handle most unexpected events.",
+    "🟢 Flourishing": "Your fund covers 6+ months of expenses. You're well protected. Even a prolonged income disruption won't immediately threaten your finances.",
+}
+
+def classify_state(fund_balance, monthly_expenditure):
+    if monthly_expenditure <= 0:
+        return STATE_LABELS[0], 0
+    coverage = fund_balance / monthly_expenditure
+    if coverage < 1:   return STATE_LABELS[0], 0
+    elif coverage < 3: return STATE_LABELS[1], 1
+    elif coverage < 6: return STATE_LABELS[2], 2
+    else:              return STATE_LABELS[3], 3
+
+def build_P(monthly_surplus, monthly_expenditure):
     """
-    Adjust the base calibrated matrix by the user's savings rate.
-    Savings rate factor s = min(monthly_savings / (target/12), 1.0)
-    — represents how aggressively the household saves relative to target.
-    Higher s shifts probability mass upward along each row.
-    The adjustment keeps all rows summing to 1 and all entries non-negative.
+    Build transition matrix with:
+    - Upward pressure from positive surplus (savings driving fund growth)
+    - Downward pressure from negative surplus (deficit draining fund)
+    - A small baseline slip probability even when saving, because in real
+      life unexpected months happen (illness, car repair, etc.) that can
+      temporarily set back even a disciplined saver.
+      Baseline slip scales inversely with surplus size — the more you save
+      above your expenses, the smaller the slip risk.
     """
-    if target_total <= 0 or monthly_savings <= 0:
-        return BASE_P.copy()
+    n = 4
+    P = np.zeros((n, n))
+    if monthly_expenditure <= 0:
+        np.fill_diagonal(P, 1.0)
+        return P
 
-    # savings rate factor: how many months of (target/12) are saved per month
-    # capped at 1.0 so it doesn't over-adjust
-    s = min(monthly_savings / (target_total / 12.0), 1.0)
+    # Baseline downward slip: even with positive surplus there is always
+    # some chance of a bad month. Ranges from ~5% (strong saver) to ~15%
+    # (barely positive). Scales with how thin the surplus margin is.
+    if monthly_surplus > 0:
+        margin_ratio = min(monthly_surplus / monthly_expenditure, 1.0)
+        # Thin margin → higher slip, thick margin → lower slip
+        baseline_slip = 0.15 * (1.0 - margin_ratio) + 0.05 * margin_ratio
+    elif monthly_surplus < 0:
+        baseline_slip = 0.0   # handled by explicit downward rate below
+    else:
+        baseline_slip = 0.10  # break-even: moderate slip risk
 
-    P = BASE_P.copy()
-    n = 5
     for i in range(n):
-        # Shift weight from diagonal and below-diagonal toward above-diagonal
-        # proportional to savings factor s
-        shift = s * 0.15   # max 15% shift at full savings rate
-        # Take shift from self-loop (diagonal) and add to next-state-up
-        if i < n - 1:
-            available = P[i, i] * shift
-            P[i, i]     -= available
-            P[i, i + 1] += available
-        # Normalise to ensure row sums to exactly 1
+        tier_amount = monthly_expenditure * TIER_WIDTHS[i]
+        rate = min(abs(monthly_surplus) / tier_amount, 0.40) if tier_amount > 0 else 0.0
+
+        if monthly_surplus > 0:
+            p_up   = rate if i < n - 1 else 0.0
+            p_down = baseline_slip if i > 0 else 0.0
+        elif monthly_surplus < 0:
+            p_up   = 0.0
+            p_down = rate if i > 0 else 0.0
+        else:
+            p_up   = 0.0
+            p_down = baseline_slip if i > 0 else 0.0
+
+        p_stay = max(1.0 - p_up - p_down, 0.0)
+
+        P[i, i]     = p_stay
+        if i < n-1: P[i, i+1] = p_up
+        if i > 0:   P[i, i-1] = p_down
+
         row_sum = P[i].sum()
-        if row_sum > 0:
-            P[i] /= row_sum
+        if row_sum > 0: P[i] /= row_sum
+
     return P
 
-
 def steady_state(P):
-    """Compute steady-state π* via power iteration (50 steps from uniform)."""
-    pi = np.ones(5) / 5.0
-    for _ in range(50):
+    pi = np.ones(4) / 4.0
+    for _ in range(200):
         pi = pi @ P
     pi /= pi.sum()
     return pi
 
-
 def mfpt_matrix(P, pi):
-    """
-    Mean First Passage Time matrix via Kemeny-Snell fundamental matrix Z.
-    Z = (I - P + W)^{-1}  where W has each row = π*
-    m_{ij} = (z_{jj} - z_{ij}) / π*_j
-    """
     n = P.shape[0]
     W = np.tile(pi, (n, 1))
-    Z = np.linalg.inv(np.eye(n) - P + W)
+    try:
+        Z = np.linalg.inv(np.eye(n) - P + W)
+    except np.linalg.LinAlgError:
+        return np.full((n, n), np.inf)
     M = np.zeros((n, n))
     for i in range(n):
         for j in range(n):
-            M[i, j] = (Z[j, j] - Z[i, j]) / pi[j] if pi[j] > 1e-10 else np.inf
+            M[i, j] = (Z[j,j] - Z[i,j]) / pi[j] if pi[j] > 1e-10 else np.inf
     return M
 
-
-def classify_state(balance, target):
-    """Classify a balance into one of the 5 fund states."""
-    if target <= 0:
-        return "S1: Vulnerable", 0
-    r = balance / target
-    if r < 0.25:   return "S1: Vulnerable", 0
-    elif r < 0.50: return "S2: Emerging",   1
-    elif r < 0.75: return "S3: Resilient",  2
-    elif r < 1.00: return "S4: Secure",     3
-    else:          return "S5: Optimal",    4
-
+def compute_pci(coverage, event_duration):
+    total = coverage + event_duration
+    return coverage / total if total > 0 else 0.0
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PAGE CONFIG
+# PAGE SETUP
 # ─────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Emergency Fund Adequate Calculator", layout="wide")
-st.title("🛡️ Emergency Fund Adequate Calculator")
-st.caption("Powered by a calibrated Markov Chain model — anchored to BLS, CFPB & Pew empirical data")
+st.set_page_config(page_title="Emergency Fund Planner", layout="wide", page_icon="🛡️")
+
+st.title("🛡️ Emergency Fund Planner")
+st.markdown("*Find out where you stand financially and exactly what you need to do to stay safe.*")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CALLBACKS
-# ─────────────────────────────────────────────────────────────────────────────
-def update_slider(key_input, key_slider):
-    st.session_state[key_slider] = st.session_state[key_input]
-
-def update_input(key_input, key_slider):
-    st.session_state[key_input] = st.session_state[key_slider]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SIDEBAR — INPUTS
+# SIDEBAR
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("📋 Essential Monthly Expenses")
-    housing   = st.number_input("Housing (Rent/Mortgage)",           min_value=0, step=500000, value=0)
-    utilities = st.number_input("Utilities (Elec/Water/Internet)",   min_value=0, step=100000, value=0)
-    transport = st.number_input("Transportation",                    min_value=0, step=100000, value=0)
-    food      = st.number_input("Food & Groceries",                  min_value=0, step=500000, value=0)
-    health    = st.number_input("Health & Insurance",                min_value=0, step=100000, value=0)
-    debt      = st.number_input("Non-mortgage debt payments",        min_value=0, step=500000, value=0)
-    childcare = st.number_input("Childcare",                         min_value=0, step=500000, value=0)
-    education = st.number_input("Education",                         min_value=0, step=500000, value=0)
-    alimony   = st.number_input("Child support and alimony",         min_value=0, step=500000, value=0)
-    other_ess = st.number_input("Other essential expenses",          min_value=0, step=100000, value=0)
+    st.header("Tell us about your finances")
+    st.caption("All amounts are monthly.")
 
-    exp_dict = {
-        "Housing": housing, "Utilities": utilities, "Transport": transport,
-        "Food": food, "Health": health, "Debt": debt, "Childcare": childcare,
-        "Education": education, "Alimony": alimony, "Other": other_ess,
-    }
-    e_basic = sum(exp_dict.values())
+    st.subheader("🏠 Essential spending")
+    housing   = st.number_input("Rent / Mortgage",        min_value=0, step=500_000, value=0)
+    food      = st.number_input("Food & Groceries",       min_value=0, step=100_000, value=0)
+    utilities = st.number_input("Utilities (electric, water, internet)", min_value=0, step=100_000, value=0)
+    transport = st.number_input("Transport",              min_value=0, step=100_000, value=0)
+    health    = st.number_input("Health & Insurance",     min_value=0, step=100_000, value=0)
+    education = st.number_input("Education",              min_value=0, step=100_000, value=0)
+    debt      = st.number_input("Loan / Debt repayments", min_value=0, step=100_000, value=0)
+    eb = housing + food + utilities + transport + health + education + debt
 
-    st.divider()
-    st.header("💰 Income & Savings Info")
+    st.subheader("🎭 Regular non-essential spending")
+    entertainment = st.number_input("Entertainment & dining out", min_value=0, step=100_000, value=0)
+    household     = st.number_input("Household goods",            min_value=0, step=100_000, value=0)
+    er = entertainment + household
 
-    for key in ["inc_val", "bal_val", "sav_val"]:
-        if key not in st.session_state:
-            st.session_state[key] = 0
+    st.subheader("✈️ Lifestyle spending")
+    holidays = st.number_input("Travel & holidays",       min_value=0, step=100_000, value=0)
+    luxury   = st.number_input("Luxury items / services", min_value=0, step=100_000, value=0)
+    el = holidays + luxury
 
-    st.number_input("Monthly Gross Income (₫)", min_value=0, max_value=500_000_000,
-                    step=500000, key="inc_val",
-                    on_change=update_slider, args=("inc_val", "inc_sld"))
-    st.slider("", min_value=0, max_value=500_000_000, step=500000, key="inc_sld",
-              on_change=update_input, args=("inc_val", "inc_sld"), label_visibility="collapsed")
-    income = st.session_state["inc_val"]
-
-    st.number_input("Current emergency funds available (₫)", min_value=0, max_value=1_000_000_000,
-                    step=500000, key="bal_val",
-                    on_change=update_slider, args=("bal_val", "bal_sld"))
-    st.slider("", min_value=0, max_value=1_000_000_000, step=500000, key="bal_sld",
-              on_change=update_input, args=("bal_val", "bal_sld"), label_visibility="collapsed")
-    current_bal = st.session_state["bal_val"]
-
-    st.number_input("Amount you can save monthly (₫)", min_value=0,
-                    max_value=max(income, 1), step=500000, key="sav_val",
-                    on_change=update_slider, args=("sav_val", "sav_sld"))
-    st.slider("", min_value=0, max_value=max(income, 1), step=500000, key="sav_sld",
-              on_change=update_input, args=("sav_val", "sav_sld"), label_visibility="collapsed")
-    monthly_savings = st.session_state["sav_val"]
-
-    rate_earn = st.number_input("Annual interest rate on savings (%)",
-                                min_value=0.0, max_value=20.0, value=0.0, step=0.1)
+    total_expenditure = eb + er + el
 
     st.divider()
-    run_calc = st.button("🚀 Calculate Analysis", use_container_width=True, type="primary")
+    st.subheader("💵 Income & savings")
+    income          = st.number_input("Monthly take-home income", min_value=0, step=500_000, value=0)
+    current_balance = st.number_input("Emergency fund you have now", min_value=0, step=500_000, value=0)
+    monthly_savings = st.number_input("How much you can save each month", min_value=0, step=100_000, value=0)
+    rate_earn       = st.number_input("Interest rate on savings (% per year)", min_value=0.0, max_value=20.0, step=0.1, value=0.0)
+
+    st.divider()
+    st.subheader("⚡ What situation are you preparing for?")
+    event_duration = st.slider(
+        "If you lost your income, how many months do you want to be covered?",
+        min_value=1, max_value=24, value=6
+    )
+
+    st.divider()
+    run = st.button("📊 Show My Results", use_container_width=True, type="primary")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN — only renders after button click
+# LANDING
 # ─────────────────────────────────────────────────────────────────────────────
-if not run_calc:
-    st.info("👈 Enter your financial details in the sidebar and click **Calculate Analysis** to begin.")
+if not run:
+    st.markdown("""
+    ### How it works
+
+    1. **Enter your monthly expenses and income** in the sidebar
+    2. **Tell us how much you've already saved** for emergencies
+    3. **Set your savings goal** — how many months of expenses you want covered
+    4. Hit **Show My Results** to get your personal financial health report
+
+    ---
+    **What you'll find out:**
+    - 🔴 Whether your current situation is dangerous or safe
+    - ⏱️ How long it will take you to reach a safe level at your current savings pace
+    - 💡 Exactly how much you should be saving each month
+    - 📈 How your situation is likely to look 2 years from now
+    """)
     st.stop()
 
-# Guard: need at least expenses
-if e_basic == 0:
-    st.warning("⚠️ Please enter at least one monthly expense before calculating.")
+if total_expenditure == 0:
+    st.warning("⚠️ Please enter at least one spending item in the sidebar.")
     st.stop()
 
-# ── Derived inputs ────────────────────────────────────────────────────────────
-target_total     = e_basic * 6
-monthly_interest = (rate_earn / 100.0) / 12.0
-curr_state_label, curr_idx = classify_state(current_bal, target_total)
+# ─────────────────────────────────────────────────────────────────────────────
+# CALCULATIONS
+# ─────────────────────────────────────────────────────────────────────────────
+monthly_interest  = (rate_earn / 100.0) / 12.0
+monthly_surplus   = income - total_expenditure + monthly_savings
+coverage_months   = current_balance / total_expenditure if total_expenditure > 0 else 0.0
+curr_label, curr_idx = classify_state(current_balance, total_expenditure)
+pci               = compute_pci(coverage_months, event_duration)
 
-# ── Build model ───────────────────────────────────────────────────────────────
-P      = build_P(monthly_savings, target_total)
+P      = build_P(monthly_surplus, total_expenditure)
 pi     = steady_state(P)
 M_mfpt = mfpt_matrix(P, pi)
 
-# State midpoints α for expected fund level (Eq. 7)
-alphas        = np.array([0.125, 0.375, 0.625, 0.875, 1.10])
-expected_fund = target_total * float(pi @ alphas)
-p_adequate    = float(pi[2] + pi[3] + pi[4])   # S3+S4+S5
-p_vulnerable  = float(pi[0] + pi[1])            # S1+S2
-p_safety      = float(pi[3] + pi[4])            # S4+S5 (app original metric)
-mfpt_to_s4    = M_mfpt[curr_idx, 3]             # months to S4: Secure
-mfpt_to_s5    = M_mfpt[curr_idx, 4]             # months to S5: Optimal
+p_safe     = float(pi[2] + pi[3])
+p_at_risk  = float(pi[0] + pi[1])
 
-COLOR_MAP = {
-    "S1: Vulnerable": "#EF553B",
-    "S2: Emerging":   "#FFA15A",
-    "S3: Resilient":  "#FECB52",
-    "S4: Secure":     "#636EFA",
-    "S5: Optimal":    "#00CC96",
-}
-STATE_LABELS = ["S1: Vulnerable", "S2: Emerging", "S3: Resilient", "S4: Secure", "S5: Optimal"]
+mfpt_to_stable      = M_mfpt[curr_idx, 2] if curr_idx < 2 else 0.0
+mfpt_to_flourishing = M_mfpt[curr_idx, 3] if curr_idx < 3 else 0.0
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 1 — FINANCIAL PROFILE SUMMARY
-# ══════════════════════════════════════════════════════════════════════════════
-st.header("📝 Summary of Your Financial Profile")
-c1, c2, c3 = st.columns([1, 1, 1.5])
+deficit = total_expenditure - income
+min_save_needed = max(deficit + 1, 0) if deficit > 0 else 0
 
-with c1:
-    st.markdown("**Monthly Income:**")
-    st.markdown(f"## `{fmt_vnd(income)}`")
-    st.markdown("**Total Essential Expenses:**")
-    st.markdown(f"## `{fmt_vnd(e_basic)}`")
-    st.markdown("**Emergency Fund Target (T = 6 × Expenses):**")
-    st.markdown(f"## `{fmt_vnd(target_total)}`")
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 1 — YOUR SITUATION RIGHT NOW
+# ─────────────────────────────────────────────────────────────────────────────
+st.header("📍 Your Situation Right Now")
 
-with c2:
-    essential_ratio = (e_basic / income * 100) if income > 0 else 0
-    st.markdown(f"**Budget Load:** `{essential_ratio:.1f}%` of income")
-    if income > 0:
-        if essential_ratio > 70:
-            st.warning("⚠️ High essential expense ratio — limited room to save.")
-        elif essential_ratio < 40:
-            st.success("✅ Healthy spending ratio — strong savings potential.")
-        else:
-            st.info("ℹ️ Moderate spending ratio.")
-    st.markdown("**Current Fund State:**")
-    state_color = {"S1": "🔴", "S2": "🟠", "S3": "🟡", "S4": "🔵", "S5": "🟢"}
-    skey = curr_state_label[:2]
-    st.markdown(f"## {state_color.get(skey,'⚪')} `{curr_state_label}`")
+col_status, col_detail = st.columns([1, 2])
 
-with c3:
-    df_exp = pd.DataFrame(list(exp_dict.items()), columns=["Category", "Amount"])
-    df_exp = df_exp[df_exp["Amount"] > 0]
-    if not df_exp.empty:
-        fig_pie = px.pie(df_exp, values="Amount", names="Category",
-                         title="Expense Breakdown", hole=0.4)
-        fig_pie.update_layout(height=260, margin=dict(l=0, r=0, t=30, b=0))
-        st.plotly_chart(fig_pie, use_container_width=True)
+with col_status:
+    # Big state card
+    state_bg = {"Distressed": "#FFEEEE", "Fragile": "#FFF3E0", "Stable": "#EEF0FF", "Flourishing": "#E8FFF5"}
+    state_border = {"Distressed": "#EF553B", "Fragile": "#FFA15A", "Stable": "#636EFA", "Flourishing": "#00CC96"}
+    raw_key = STATE_KEYS[curr_idx]
+    bg   = state_bg[raw_key]
+    bord = state_border[raw_key]
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — ACCUMULATION PROJECTION
-# ══════════════════════════════════════════════════════════════════════════════
+    st.markdown(f"""
+    <div style="background:{bg}; border-left: 6px solid {bord};
+                padding: 20px; border-radius: 8px; margin-bottom:12px;">
+        <div style="font-size:2rem; font-weight:700; color:{bord};">{curr_label}</div>
+        <div style="font-size:1rem; margin-top:8px; color:#333;">
+            {STATE_DESCRIPTIONS[curr_label]}
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.metric("Your emergency fund covers", f"{coverage_months:.1f} months of expenses")
+
+with col_detail:
+    c1, c2 = st.columns(2)
+    with c1:
+        st.metric("Monthly income",      fmt_money(income))
+        st.metric("Monthly spending",    fmt_money(total_expenditure))
+        surplus_label = "Left over each month" if monthly_surplus >= 0 else "Shortfall each month"
+        st.metric(surplus_label,
+                  fmt_money(abs(monthly_surplus)),
+                  delta="✅ Positive" if monthly_surplus > 0 else ("⚠️ Break-even" if monthly_surplus == 0 else "🚨 Negative"),
+                  delta_color="normal" if monthly_surplus > 0 else "inverse")
+    with c2:
+        st.metric("Emergency fund balance", fmt_money(current_balance))
+        st.metric("Monthly savings set aside", fmt_money(monthly_savings))
+        st.metric("Savings interest rate", f"{rate_earn:.1f}% / year")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 2 — CAN YOU SURVIVE YOUR SCENARIO?
+# ─────────────────────────────────────────────────────────────────────────────
 st.divider()
-st.header("🎯 Accumulation Projection")
+st.header(f"⚡ If You Lost Your Income for {event_duration} Months...")
 
-if e_basic > 0:
-    s2_t, s3_t, s4_t, s5_t = (target_total * f for f in [0.25, 0.50, 0.75, 1.00])
-    max_limit     = 120
-    months_display = 24
+pci_col, gauge_col = st.columns([2, 1])
 
-    # Find how many months to hit target (for chart length)
-    if monthly_savings > 0:
-        tmp = current_bal
-        for m in range(max_limit + 1):
-            if tmp >= s5_t:
-                months_display = max(24, m)
-                break
-            tmp = (tmp + monthly_savings) * (1 + monthly_interest)
+with pci_col:
+    if pci >= 0.5:
+        st.success(f"""
+        ✅ **You're covered.**
 
-    history_bal = []
-    tmp = current_bal
-    reached = {"S2": None, "S3": None, "S4": None, "S5": None}
+        Your current emergency fund of **{fmt_money(current_balance)}** 
+        can support **{coverage_months:.1f} months** of expenses — 
+        enough to get through a **{event_duration}-month** disruption.
 
-    for m in range(months_display + 1):
-        label, _ = classify_state(tmp, target_total)
-        history_bal.append({"Month": m, "Balance": tmp, "Status": label})
-        for key, thresh in zip(["S2","S3","S4","S5"], [s2_t,s3_t,s4_t,s5_t]):
-            if reached[key] is None and tmp >= thresh:
-                reached[key] = m
-        tmp = (tmp + monthly_savings) * (1 + monthly_interest)
+        You have a **{coverage_months - event_duration:.1f}-month buffer** beyond your target.
+        """)
+    else:
+        shortfall_months = event_duration - coverage_months
+        shortfall_amount = shortfall_months * total_expenditure
+        st.error(f"""
+        🚨 **Your fund is not enough.**
 
-    df_growth = pd.DataFrame(history_bal)
-    col_plot, col_coach = st.columns([2, 1])
+        You can only cover **{coverage_months:.1f} months** but need **{event_duration} months**.
+        
+        You are short by **{shortfall_months:.1f} months** of expenses — 
+        that's about **{fmt_money(shortfall_amount)}** that you do not currently have.
 
-    with col_plot:
-        fig_growth = px.bar(df_growth, x="Month", y="Balance",
-                            title=f"Fund Balance Projection ({months_display} months)",
-                            color="Status", color_discrete_map=COLOR_MAP)
-        for thresh, ann in zip([s2_t, s3_t, s4_t, s5_t], ["25% T", "50% T", "75% T", "Target T"]):
-            fig_growth.add_hline(y=thresh, line_dash="dash", line_color="#555",
-                                 annotation_text=ann, annotation_position="right")
-        fig_growth.update_layout(yaxis_title="Fund Balance (₫)", xaxis_title="Month")
-        st.plotly_chart(fig_growth, use_container_width=True)
+        If something happened today, you would run out of money after {coverage_months:.1f} months 
+        and would need to borrow, sell assets, or rely on others.
+        """)
 
-    with col_coach:
-        st.subheader("📅 Months to Each State")
-        for key, lbl_txt in zip(["S2","S3","S4","S5"],
-                                 ["S2: Emerging","S3: Resilient","S4: Secure","S5: Optimal"]):
-            if reached[key] is not None:
-                st.write(f"🔸 **{lbl_txt}:** Month {reached[key]}")
-            else:
-                st.write(f"⚪ **{lbl_txt}:** Not reached in {months_display} months")
+with gauge_col:
+    fig_gauge = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=round(pci, 2),
+        number={"suffix": "", "font": {"size": 36}},
+        title={"text": "Readiness Score", "font": {"size": 14}},
+        gauge={
+            "axis": {"range": [0, 1], "tickvals": [0, 0.5, 1],
+                     "ticktext": ["Not ready", "Just OK", "Well covered"]},
+            "bar":  {"color": "#00CC96" if pci >= 0.5 else "#EF553B"},
+            "steps": [
+                {"range": [0, 0.5],  "color": "#FFEEEE"},
+                {"range": [0.5, 1.0], "color": "#EEFFEE"},
+            ],
+            "threshold": {
+                "line": {"color": "black", "width": 3},
+                "thickness": 0.75, "value": 0.5
+            }
+        }
+    ))
+    fig_gauge.update_layout(height=220, margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(fig_gauge, use_container_width=True)
 
-        if reached["S5"] is not None:
-            st.success(f"🚀 **Goal reached at Month {reached['S5']}!**")
-            st.info("Advice: Target achieved. Consider diversifying into investments.")
-        elif monthly_savings > 0:
-            st.warning("⚠️ Target not reached within projection horizon. Consider increasing monthly savings.")
-        else:
-            st.error("🛑 No monthly savings entered — fund cannot grow.")
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — MARKOV MODEL (FIXED)
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 3 — HOW LONG TO GET TO SAFETY?
+# ─────────────────────────────────────────────────────────────────────────────
 st.divider()
-st.header("🎲 Markov Chain Model — Financial State Analysis")
+st.header("⏱️ How Long Until You're Safe?")
 
-with st.expander("ℹ️ About this model", expanded=False):
-    st.markdown("""
-    This section applies a **calibrated Discrete-Time Markov Chain** to model your emergency fund dynamics.
+time_cols = st.columns(4)
+state_targets = [
+    ("🔴 Less than 1 month covered",  0, "Distressed"),
+    ("🟠 1–3 months covered",          1, "Fragile"),
+    ("🔵 3–6 months covered",          2, "Stable"),
+    ("🟢 6+ months covered",           3, "Flourishing"),
+]
 
-    **Key improvements over naive models:**
-    - The transition matrix **P** is empirically calibrated using:
-        - BLS Job Openings & Labor Turnover Survey (λ₁ ≈ 1.8%/month)
-        - CFPB Making Ends Meet Survey 2022 (λ₂ ≈ 2.8%/month)
-        - Pew Charitable Trusts Financial Shocks (λ₃ ≈ 2.9%/month)
-        - **Composite shock rate λ ≈ 7.3% per month**
-    - Your savings rate adjusts the matrix upward bias (up to 15% shift)
-    - All three prescriptive outputs (Eq. 4, 5, 6 from the model framework) are computed
-    """)
+for col, (label, idx, key) in zip(time_cols, state_targets):
+    mfpt_val = M_mfpt[curr_idx, idx]
+    bord = {"Distressed":"#EF553B","Fragile":"#FFA15A","Stable":"#636EFA","Flourishing":"#00CC96"}[key]
+    with col:
+        if idx == curr_idx:
+            st.markdown(f"""
+            <div style="border:2px solid {bord}; border-radius:8px; padding:12px; text-align:center;">
+                <div style="font-size:0.85rem; color:#555;">{label}</div>
+                <div style="font-size:1.3rem; font-weight:700; color:{bord}; margin-top:6px;">📍 You are here</div>
+            </div>
+            """, unsafe_allow_html=True)
+        elif idx < curr_idx:
+            st.markdown(f"""
+            <div style="border:2px solid #ccc; border-radius:8px; padding:12px; text-align:center; opacity:0.5;">
+                <div style="font-size:0.85rem; color:#555;">{label}</div>
+                <div style="font-size:1.3rem; font-weight:700; color:#aaa; margin-top:6px;">✅ Already passed</div>
+            </div>
+            """, unsafe_allow_html=True)
+        elif np.isinf(mfpt_val) or mfpt_val > 999:
+            st.markdown(f"""
+            <div style="border:2px solid {bord}; border-radius:8px; padding:12px; text-align:center;">
+                <div style="font-size:0.85rem; color:#555;">{label}</div>
+                <div style="font-size:1.3rem; font-weight:700; color:#EF553B; margin-top:6px;">⚠️ Not reachable</div>
+                <div style="font-size:0.8rem; color:#888; margin-top:4px;">Save more each month</div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            years = mfpt_val / 12
+            time_str = f"{mfpt_val:.0f} months" if years < 1 else f"{years:.1f} years"
+            st.markdown(f"""
+            <div style="border:2px solid {bord}; border-radius:8px; padding:12px; text-align:center;">
+                <div style="font-size:0.85rem; color:#555;">{label}</div>
+                <div style="font-size:1.6rem; font-weight:700; color:{bord}; margin-top:6px;">{time_str}</div>
+                <div style="font-size:0.8rem; color:#888; margin-top:4px;">at your current savings pace</div>
+            </div>
+            """, unsafe_allow_html=True)
 
-col_m1, col_m2 = st.columns([1, 1])
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 4 — WHAT YOUR FUTURE LOOKS LIKE
+# ─────────────────────────────────────────────────────────────────────────────
+st.divider()
+st.header("📈 What Your Next 24 Months Look Like")
 
-with col_m1:
-    # ── Transition matrix display ─────────────────────────────────────────────
-    st.subheader("Transition Matrix P")
-    df_P = pd.DataFrame(P,
-                        index=["S1: Vuln", "S2: Emerg", "S3: Resil", "S4: Secure", "S5: Optimal"],
-                        columns=["→S1", "→S2", "→S3", "→S4", "→S5"])
-    st.dataframe(df_P.style.format("{:.1%}")
-                 .background_gradient(cmap="Blues", axis=None),
-                 use_container_width=True)
+forecast_col, info_col = st.columns([2, 1])
 
-    # ── Steady-state distribution ─────────────────────────────────────────────
-    st.subheader("Steady-State Distribution π*")
-    df_pi = pd.DataFrame({
-        "State":       STATE_LABELS,
-        "π* (long-run prob)": pi,
-    })
-    fig_pi = px.bar(df_pi, x="State", y="π* (long-run prob)",
-                    color="State", color_discrete_map=COLOR_MAP,
-                    title="Long-Run State Distribution",
-                    text_auto=".1%")
-    fig_pi.update_layout(showlegend=False, yaxis_tickformat=".0%",
-                         yaxis_title="Probability", height=280)
-    st.plotly_chart(fig_pi, use_container_width=True)
-
-with col_m2:
-    # ── 24-month probability forecast ─────────────────────────────────────────
-    st.subheader("24-Month Probability Forecast")
-    v = np.zeros(5)
+with forecast_col:
+    v = np.zeros(4)
     v[curr_idx] = 1.0
     history_m = [v.copy()]
     for _ in range(24):
         v = v @ P
         history_m.append(v.copy())
 
-    fig_area = px.area(
-        pd.DataFrame(history_m, columns=STATE_LABELS),
-        title=f"Starting from {curr_state_label}",
-        color_discrete_map=COLOR_MAP,
+    df_forecast = pd.DataFrame(history_m, columns=STATE_LABELS)
+    df_forecast.index.name = "Month"
+    df_forecast = df_forecast.reset_index()
+
+    df_lines = pd.DataFrame({
+        "Month": df_forecast["Month"],
+        "🟢 Chance of being safe (3+ months covered)": df_forecast["🔵 Stable"] + df_forecast["🟢 Flourishing"],
+        "🔴 Chance of being at risk (less than 3 months)": df_forecast["🔴 Distressed"] + df_forecast["🟠 Fragile"],
+    })
+
+    fig_lines = px.line(
+        df_lines, x="Month",
+        y=["🟢 Chance of being safe (3+ months covered)",
+           "🔴 Chance of being at risk (less than 3 months)"],
+        color_discrete_map={
+            "🟢 Chance of being safe (3+ months covered)": "#00CC96",
+            "🔴 Chance of being at risk (less than 3 months)": "#EF553B",
+        },
+        title="Over the next 24 months — how likely are you to be safe vs at risk?",
     )
-    fig_area.update_layout(yaxis_tickformat=".0%", yaxis_title="Probability",
-                           xaxis_title="Month", height=300)
-    st.plotly_chart(fig_area, use_container_width=True)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — THREE PRESCRIPTIVE OUTPUTS (Eq. 4, 5, 6)
-# ══════════════════════════════════════════════════════════════════════════════
-st.divider()
-st.header("📊 Prescriptive Recommendations")
-st.caption("Based on Equations (4), (5), and (6) from the Markov Chain Model Framework")
-
-r1, r2, r3, r4 = st.columns(4)
-
-with r1:
-    st.metric(
-        label="🎯 Emergency Fund Target T",
-        value=fmt_vnd(target_total),
-        help="T = Monthly Expenses × 6  |  Eq. (1)"
+    fig_lines.add_hline(
+        y=0.5, line_dash="dot", line_color="#aaa",
+        annotation_text="50/50", annotation_position="right"
     )
-
-with r2:
-    delta_fund = expected_fund - target_total
-    st.metric(
-        label="📈 Expected Long-Run Fund  E[F∞]",
-        value=fmt_vnd(expected_fund),
-        delta=f"{fmt_vnd(abs(delta_fund))} {'surplus' if delta_fund >= 0 else 'shortfall'}",
-        delta_color="normal" if delta_fund >= 0 else "inverse",
-        help="E[F∞] = T · Σ(π*ᵢ · αᵢ)  |  Eq. (4)"
+    fig_lines.update_layout(
+        yaxis_tickformat=".0%",
+        yaxis_title="Probability",
+        xaxis_title="Month from now",
+        legend_title=None,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.40, xanchor="left", x=0),
+        height=340,
+        margin=dict(t=40, b=70)
     )
-
-with r3:
-    st.metric(
-        label="✅ P(Fund Adequate: S3–S5)",
-        value=f"{p_adequate:.1%}",
-        delta="≥ 70% recommended",
-        delta_color="normal" if p_adequate >= 0.70 else "inverse",
-        help="P(Adequate) = π*₃ + π*₄ + π*₅  |  Eq. (5)"
+    st.plotly_chart(fig_lines, use_container_width=True)
+    st.caption(
+        "**Safe** = your fund covers 3 or more months of expenses. "
+        "**At risk** = your fund covers less than 3 months. "
+        "The two lines always add up to 100%."
     )
 
-with r4:
-    st.metric(
-        label="🛡️ Long-Run Safety P(S4+S5)",
-        value=f"{p_safety:.1%}",
-        help="Probability of being in Secure or Optimal state long-run"
-    )
+month_6_safe  = float(df_lines["🟢 Chance of being safe (3+ months covered)"].iloc[6])
+month_24_safe = float(df_lines["🟢 Chance of being safe (3+ months covered)"].iloc[24])
 
-# ── MFPT recommendations ──────────────────────────────────────────────────────
-st.subheader(f"⏱️ Mean First Passage Time — from your current state: {curr_state_label}")
-st.caption("How many months until you first reach each state?  |  Eq. (6): m_ij = (z_jj − z_ij) / π*_j")
+with info_col:
+    st.markdown("**What this means for you:**")
+    st.markdown("<br>", unsafe_allow_html=True)
 
-mfpt_cols = st.columns(5)
-for j, (col, slabel) in enumerate(zip(mfpt_cols, STATE_LABELS)):
-    mfpt_val = M_mfpt[curr_idx, j]
-    with col:
-        if j == curr_idx:
-            st.metric(label=slabel, value="Current", delta="You are here")
-        elif j < curr_idx:
-            st.metric(label=slabel, value="—",
-                      delta="Already passed", delta_color="off")
-        elif np.isinf(mfpt_val) or mfpt_val > 999:
-            st.metric(label=slabel, value="Unreachable",
-                      delta="Increase savings", delta_color="inverse")
-        else:
-            st.metric(label=slabel, value=f"{mfpt_val:.1f} months",
-                      delta=f"≈ {mfpt_val/12:.1f} years")
+    m6_icon  = "🟢" if month_6_safe  >= 0.6 else "🔴"
+    m24_icon = "🟢" if month_24_safe >= 0.6 else "🔴"
+    st.markdown(f"{m6_icon} **In 6 months:** {month_6_safe:.0%} chance of being safe")
+    st.markdown(f"{m24_icon} **In 24 months:** {month_24_safe:.0%} chance of being safe")
 
-# ── Key recommendation box ────────────────────────────────────────────────────
-st.divider()
-if p_adequate < 0.70:
-    needed_savings_approx = (target_total / 12) * (0.70 / max(p_adequate, 0.01) - 1) * 0.3
-    st.error(
-        f"⚠️ **Your long-run adequacy probability is {p_adequate:.1%}** — below the 70% recommended threshold.  \n"
-        f"Consider increasing your monthly savings. "
-        f"Current savings: **{fmt_vnd(monthly_savings)}**.  \n"
-        f"Estimated time to S4 (Secure): **{mfpt_to_s4:.1f} months** from your current state."
-    )
-elif p_adequate >= 0.90:
-    st.success(
-        f"🌟 **Excellent! Your long-run adequacy probability is {p_adequate:.1%}**.  \n"
-        f"Your savings behaviour places you on a strong trajectory.  \n"
-        f"Estimated time to S5 (Optimal): **{mfpt_to_s5:.1f} months**."
-    )
-else:
+    st.markdown("<br>", unsafe_allow_html=True)
     st.info(
-        f"✅ **Good standing — long-run adequacy probability: {p_adequate:.1%}**.  \n"
-        f"You are on track. Estimated time to S4 (Secure): **{mfpt_to_s4:.1f} months**.  \n"
-        f"Maintain your current savings discipline."
+        "**What does 'safe' mean here?**\n\n"
+        "It means your emergency fund covers at least 3 months of your expenses — "
+        "enough to survive a job loss, a medical bill, or another major unexpected event "
+        "without having to borrow money."
     )
+    st.markdown("<br>", unsafe_allow_html=True)
 
-# ── Full MFPT matrix (expandable) ────────────────────────────────────────────
-with st.expander("📐 Full Mean First Passage Time Matrix (all states × all states)"):
-    df_mfpt = pd.DataFrame(
-        M_mfpt,
-        index=[f"From {s}" for s in STATE_LABELS],
-        columns=[f"To {s}" for s in STATE_LABELS],
-    )
-    st.caption("Values in months. Diagonal = mean return time = 1/π*ⱼ")
-    st.dataframe(df_mfpt.style.format(lambda x: f"{x:.1f}" if not np.isinf(x) else "∞"),
-                 use_container_width=True)
+    if month_24_safe >= 0.70:
+        st.success("✅ You are on a strong path. Keep saving at this pace.")
+    elif month_24_safe >= 0.50:
+        st.warning("⚠️ You have a moderate chance of being safe in 2 years. Saving a bit more each month would make a big difference.")
+    else:
+        st.error("🚨 At your current pace, you are more likely to still be at risk in 2 years. See the recommendation below for what to change.")
 
-# ── Model calibration note ────────────────────────────────────────────────────
-with st.expander("🔬 Model Calibration Details"):
-    st.markdown(f"""
-    | Parameter | Value | Source |
-    |---|---|---|
-    | Composite shock rate λ | 7.3% / month | BLS + CFPB + Pew |
-    | Savings adjustment factor s | {min(monthly_savings/(target_total/12),1.0) if target_total>0 else 0:.3f} | Your inputs |
-    | Steady-state π*(S1) | {pi[0]:.3f} | Power iteration n=50 |
-    | Steady-state π*(S4) | {pi[3]:.3f} | Power iteration n=50 |
-    | Steady-state π*(S5) | {pi[4]:.3f} | Power iteration n=50 |
-    | Mean return time S4 | {1/pi[3]:.1f} months | = 1/π*(S4) |
-    | Mean return time S5 | {1/pi[4]:.1f} months | = 1/π*(S5) |
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 5 — WHAT SHOULD YOU DO?
+# ─────────────────────────────────────────────────────────────────────────────
+st.divider()
+st.header("💡 What Should You Do?")
+
+# Build savings scenarios
+scenario_savings = []
+if min_save_needed > 0:
+    scenario_savings = [0, min_save_needed, int(min_save_needed * 1.5), int(min_save_needed * 2)]
+else:
+    base = max(monthly_savings, int(total_expenditure * 0.05))
+    scenario_savings = [0, base, base * 2, base * 3]
+
+if monthly_savings not in scenario_savings:
+    scenario_savings.append(monthly_savings)
+scenario_savings = sorted(set([max(0, int(x)) for x in scenario_savings]))
+
+rows = []
+for s_test in scenario_savings:
+    surplus_test = income - total_expenditure + s_test
+    P_test  = build_P(surplus_test, total_expenditure)
+    pi_test = steady_state(P_test)
+    M_test  = mfpt_matrix(P_test, pi_test)
+    mfpt_s3 = M_test[curr_idx, 2]
+    mfpt_s4 = M_test[curr_idx, 3]
+    p_safe_test = float(pi_test[2] + pi_test[3])
+
+    if surplus_test > 0:
+        drift = "📈 Growing"
+    elif surplus_test == 0:
+        drift = "➡️ Flat"
+    else:
+        drift = "📉 Shrinking"
+
+    rows.append({
+        "If you save each month":    fmt_money(s_test),
+        "Your fund will be":         drift,
+        "Months to reach Stable 🔵": f"{mfpt_s3:.0f} months" if not np.isinf(mfpt_s3) and curr_idx < 2 else ("Already there ✅" if curr_idx >= 2 else "Not reachable ⚠️"),
+        "Months to reach Flourishing 🟢": f"{mfpt_s4:.0f} months" if not np.isinf(mfpt_s4) and curr_idx < 3 else ("Already there ✅" if curr_idx >= 3 else "Not reachable ⚠️"),
+        "Long-run chance of being safe": f"{p_safe_test:.0%}",
+    })
+
+df_scenarios = pd.DataFrame(rows)
+
+# Highlight the user's current savings row
+def highlight_current(row):
+    if row["If you save each month"] == fmt_money(monthly_savings):
+        return ["background-color: #fffde7"] * len(row)
+    return [""] * len(row)
+
+st.markdown("**Here's how your outcome changes based on how much you save:**")
+st.caption(f"Your current savings is highlighted — {fmt_money(monthly_savings)}/month")
+st.dataframe(df_scenarios.style.apply(highlight_current, axis=1), use_container_width=True, hide_index=True)
+
+# Plain-English recommendation
+st.markdown("### 🎯 Our Recommendation")
+
+if monthly_surplus > 0 and curr_idx >= 2:
+    st.success(f"""
+    **You're in good shape.** Your fund is growing and you're already in a stable or flourishing state.
+
+    Keep saving **{fmt_money(monthly_savings)}/month** and you'll maintain this strong position.
+    
+    If you want extra security, consider putting any extra money into a higher-yield savings account 
+    to make your fund work harder for you.
     """)
+elif monthly_surplus > 0 and curr_idx < 2:
+    months_to_stable = M_mfpt[curr_idx, 2]
+    st.info(f"""
+    **You're on the right track**, but not safe yet.
+    
+    At your current savings pace of **{fmt_money(monthly_savings)}/month**, 
+    you should reach a stable safety level in about **{months_to_stable:.0f} months**.
+    
+    If you can save a little more each month, you'll get there faster — 
+    see the table above to find the right number for you.
+    """)
+elif monthly_surplus == 0:
+    st.warning(f"""
+    **Your income and spending are balanced — but you're not building any cushion.**
+    
+    Any unexpected expense right now would hurt you because your fund isn't growing.
+    
+    Try to find **{fmt_money(int(total_expenditure * 0.05))}–{fmt_money(int(total_expenditure * 0.10))}/month** 
+    to set aside. Even a small amount will start moving you toward safety.
+    """)
+else:
+    st.error(f"""
+    **You're spending more than you earn each month.** This means your emergency fund 
+    is slowly being used up, leaving you more vulnerable over time.
+    
+    **The most important step right now:** reduce monthly spending by at least 
+    **{fmt_money(abs(monthly_surplus))}**, or increase your income by that amount.
+    
+    Once your income covers your expenses, any additional savings will start rebuilding your fund.
+    The table above shows what happens when you do.
+    """)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 6 — FUND GROWTH PROJECTION
+# ─────────────────────────────────────────────────────────────────────────────
+st.divider()
+st.header("📊 Fund Growth Projection")
+
+if monthly_savings > 0 or current_balance > 0:
+    proj_months = 36
+    balance_history = []
+    bal = float(current_balance)
+
+    for m in range(proj_months + 1):
+        label, _ = classify_state(bal, total_expenditure)
+        coverage = bal / total_expenditure if total_expenditure > 0 else 0
+        balance_history.append({
+            "Month": m,
+            "Balance": bal,
+            "Coverage (months)": round(coverage, 2),
+            "State": label,
+        })
+        bal = (bal + monthly_savings) * (1 + monthly_interest)
+
+    df_proj = pd.DataFrame(balance_history)
+
+    fig_proj = px.bar(
+        df_proj, x="Month", y="Balance",
+        color="State", color_discrete_map=COLOR_MAP,
+        title="Your emergency fund balance over the next 3 years",
+        labels={"Balance": "Fund Balance", "Month": "Month from now"}
+    )
+
+    # Add coverage lines
+    for months_cov, label_text, color in [
+        (1, "1 month covered",  "#FFA15A"),
+        (3, "3 months covered", "#636EFA"),
+        (6, "6 months covered", "#00CC96"),
+    ]:
+        fig_proj.add_hline(
+            y=months_cov * total_expenditure,
+            line_dash="dash", line_color=color,
+            annotation_text=label_text,
+            annotation_position="right"
+        )
+
+    fig_proj.update_layout(
+        yaxis_title="Fund Balance",
+        xaxis_title="Month from now",
+        height=350,
+        legend_title="Financial State"
+    )
+    st.plotly_chart(fig_proj, use_container_width=True)
+
+    # Milestone callouts
+    milestones = {1: None, 3: None, 6: None}
+    for row in balance_history:
+        cov = row["Coverage (months)"]
+        for target in milestones:
+            if milestones[target] is None and cov >= target:
+                milestones[target] = row["Month"]
+
+    m1, m2, m3 = st.columns(3)
+    for col, (target, month_reached) in zip([m1, m2, m3], milestones.items()):
+        with col:
+            if month_reached is not None:
+                if month_reached == 0:
+                    col.metric(f"{target}-month coverage", "Already there ✅")
+                else:
+                    col.metric(f"{target}-month coverage", f"Month {month_reached}", f"≈ {month_reached/12:.1f} years")
+            else:
+                col.metric(f"{target}-month coverage", "Not reached in 3 years", delta="Save more", delta_color="inverse")
+else:
+    st.info("Enter a savings amount or current balance to see your fund growth projection.")
