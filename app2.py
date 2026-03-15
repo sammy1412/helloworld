@@ -202,20 +202,20 @@ if total_expenditure == 0:
 # CALCULATIONS
 # ─────────────────────────────────────────────────────────────────────────────
 monthly_interest  = (rate_earn / 100.0) / 12.0
-monthly_surplus   = income - total_expenditure + monthly_savings
+monthly_surplus   = income - total_expenditure
 coverage_months   = current_balance / total_expenditure if total_expenditure > 0 else 0.0
 curr_label, curr_idx = classify_state(current_balance, total_expenditure)
 pci               = compute_pci(coverage_months, event_duration)
 
-P      = build_P(monthly_surplus, total_expenditure)
+monthly_surplus   = income - total_expenditure
+effective_surplus = monthly_surplus + monthly_savings  # savings actively grow the fund
+
+P      = build_P(effective_surplus, total_expenditure)
 pi     = steady_state(P)
 M_mfpt = mfpt_matrix(P, pi)
 
 p_safe     = float(pi[2] + pi[3])
 p_at_risk  = float(pi[0] + pi[1])
-
-mfpt_to_stable      = M_mfpt[curr_idx, 2] if curr_idx < 2 else 0.0
-mfpt_to_flourishing = M_mfpt[curr_idx, 3] if curr_idx < 3 else 0.0
 
 deficit = total_expenditure - income
 min_save_needed = max(deficit + 1, 0) if deficit > 0 else 0
@@ -252,7 +252,7 @@ with col_detail:
     with c1:
         st.metric("Monthly income",      fmt_money(income))
         st.metric("Monthly spending",    fmt_money(total_expenditure))
-        surplus_label = "Left over each month" if monthly_surplus >= 0 else "Shortfall each month"
+        surplus_label = "Operating surplus / month" if monthly_surplus >= 0 else "Shortfall each month"
         st.metric(surplus_label,
                   fmt_money(abs(monthly_surplus)),
                   delta="✅ Positive" if monthly_surplus > 0 else ("⚠️ Break-even" if monthly_surplus == 0 else "🚨 Negative"),
@@ -260,7 +260,7 @@ with col_detail:
     with c2:
         st.metric("Emergency fund balance", fmt_money(current_balance))
         st.metric("Monthly savings set aside", fmt_money(monthly_savings))
-        st.metric("Savings interest rate", f"{rate_earn:.1f}% / year")
+        st.metric("Effective monthly fund growth", fmt_money(effective_surplus))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 2 — CAN YOU SURVIVE YOUR SCENARIO?
@@ -301,10 +301,10 @@ with gauge_col:
         mode="gauge+number",
         value=round(pci, 2),
         number={"suffix": "", "font": {"size": 36}},
-        title={"text": "Readiness Score", "font": {"size": 14}},
+        title={"text": "Readiness Score (PCI)", "font": {"size": 14}},
         gauge={
-            "axis": {"range": [0, 1], "tickvals": [0, 0.5, 1],
-                     "ticktext": ["Not ready", "Just OK", "Well covered"]},
+            "axis": {"range": [0, 1], "tickvals": [0, 0.25, 0.5, 0.75, 1],
+                     "ticktext": ["0", "0.25", "0.50", "0.75", "1.0"]},
             "bar":  {"color": "#00CC96" if pci >= 0.5 else "#EF553B"},
             "steps": [
                 {"range": [0, 0.5],  "color": "#FFEEEE"},
@@ -318,6 +318,14 @@ with gauge_col:
     ))
     fig_gauge.update_layout(height=220, margin=dict(l=10, r=10, t=40, b=10))
     st.plotly_chart(fig_gauge, use_container_width=True)
+
+    # Dynamic verdict based on actual PCI value
+    if pci >= 0.5:
+        st.success(f"✅ **Covered** — PCI {pci:.2f} ≥ 0.50")
+    elif pci >= 0.25:
+        st.warning(f"⚠️ **Partially covered** — PCI {pci:.2f} < 0.50")
+    else:
+        st.error(f"🚨 **Not covered** — PCI {pci:.2f} far below 0.50")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 3 — HOW LONG TO GET TO SAFETY?
@@ -474,17 +482,17 @@ scenario_savings = sorted(set([max(0, int(x)) for x in scenario_savings]))
 
 rows = []
 for s_test in scenario_savings:
-    surplus_test = income - total_expenditure + s_test
-    P_test  = build_P(surplus_test, total_expenditure)
+    effective_test = monthly_surplus + s_test
+    P_test  = build_P(effective_test, total_expenditure)
     pi_test = steady_state(P_test)
     M_test  = mfpt_matrix(P_test, pi_test)
     mfpt_s3 = M_test[curr_idx, 2]
     mfpt_s4 = M_test[curr_idx, 3]
     p_safe_test = float(pi_test[2] + pi_test[3])
 
-    if surplus_test > 0:
+    if effective_test > 0:
         drift = "📈 Growing"
-    elif surplus_test == 0:
+    elif effective_test == 0:
         drift = "➡️ Flat"
     else:
         drift = "📉 Shrinking"
@@ -573,7 +581,8 @@ if monthly_savings > 0 or current_balance > 0:
             "Coverage (months)": round(coverage, 2),
             "State": label,
         })
-        bal = (bal + monthly_savings) * (1 + monthly_interest)
+        monthly_addition = monthly_surplus + monthly_savings
+        bal = (bal + monthly_addition) * (1 + monthly_interest)
 
     df_proj = pd.DataFrame(balance_history)
 
