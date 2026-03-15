@@ -13,6 +13,19 @@ def fmt_money(amount):
         return "0 ₫"
     return "{:,.0f} ₫".format(amount).replace(",", ".")
 
+def fmt_money_short(amount):
+    """Compact format for narrow columns: 8.1M ₫, 500K ₫"""
+    if amount is None or amount == 0:
+        return "0 ₫"
+    abs_val = abs(amount)
+    if abs_val >= 1_000_000_000:
+        return f"{amount/1_000_000_000:.1f}B ₫"
+    elif abs_val >= 1_000_000:
+        return f"{amount/1_000_000:.1f}M ₫"
+    elif abs_val >= 1_000:
+        return f"{amount/1_000:.0f}K ₫"
+    return f"{amount:.0f} ₫"
+
 TIER_WIDTHS = [1, 2, 3, 3]
 
 STATE_LABELS = ["🔴 Distressed", "🟠 Fragile", "🔵 Stable", "🟢 Flourishing"]
@@ -225,42 +238,151 @@ min_save_needed = max(deficit + 1, 0) if deficit > 0 else 0
 # ─────────────────────────────────────────────────────────────────────────────
 st.header("📍 Your Situation Right Now")
 
-col_status, col_detail = st.columns([1, 2])
+state_bg     = {"Distressed": "#FFEEEE", "Fragile": "#FFF3E0", "Stable": "#EEF0FF", "Flourishing": "#E8FFF5"}
+state_border = {"Distressed": "#EF553B", "Fragile": "#FFA15A", "Stable": "#636EFA", "Flourishing": "#00CC96"}
+raw_key = STATE_KEYS[curr_idx]
+bg   = state_bg[raw_key]
+bord = state_border[raw_key]
 
-with col_status:
-    # Big state card
-    state_bg = {"Distressed": "#FFEEEE", "Fragile": "#FFF3E0", "Stable": "#EEF0FF", "Flourishing": "#E8FFF5"}
-    state_border = {"Distressed": "#EF553B", "Fragile": "#FFA15A", "Stable": "#636EFA", "Flourishing": "#00CC96"}
-    raw_key = STATE_KEYS[curr_idx]
-    bg   = state_bg[raw_key]
-    bord = state_border[raw_key]
+# ── Row 1: State card + 4 key metrics ──
+card_col, m1, m2, m3, m4 = st.columns([2, 1, 1, 1, 1])
 
+with card_col:
+    urgency_line = f"⚡ Fund runs out in <b>{coverage_months:.1f} months</b> if income stopped today."
     st.markdown(f"""
-    <div style="background:{bg}; border-left: 6px solid {bord};
-                padding: 20px; border-radius: 8px; margin-bottom:12px;">
-        <div style="font-size:2rem; font-weight:700; color:{bord};">{curr_label}</div>
-        <div style="font-size:1rem; margin-top:8px; color:#333;">
-            {STATE_DESCRIPTIONS[curr_label]}
-        </div>
+    <div style="background:{bg}; border-left:6px solid {bord};
+                padding:16px 20px; border-radius:8px; height:100%;">
+        <div style="font-size:1.6rem; font-weight:700; color:{bord}; margin-bottom:6px;">{curr_label}</div>
+        <div style="font-size:0.9rem; color:#444; margin-bottom:10px;">{STATE_DESCRIPTIONS[curr_label]}</div>
+        <div style="font-size:0.85rem; color:{bord}; font-weight:600;">{urgency_line}</div>
     </div>
     """, unsafe_allow_html=True)
 
-    st.metric("Your emergency fund covers", f"{coverage_months:.1f} months of expenses")
+with m1:
+    st.metric("💰 Monthly income", fmt_money_short(income))
+with m2:
+    st.metric("🛒 Monthly spending", fmt_money_short(total_expenditure))
+with m3:
+    surplus_icon = "✅" if monthly_surplus > 0 else ("⚠️" if monthly_surplus == 0 else "🚨")
+    surplus_label = "Income after expenses" if monthly_surplus >= 0 else "Monthly shortfall"
+    st.metric(f"{surplus_icon} {surplus_label}",
+              fmt_money_short(abs(monthly_surplus)),
+              delta="Positive" if monthly_surplus > 0 else ("Break-even" if monthly_surplus == 0 else "Negative"),
+              delta_color="normal" if monthly_surplus > 0 else "inverse")
+with m4:
+    st.metric("🏦 Emergency fund", fmt_money_short(current_balance),
+              delta=f"Covers {coverage_months:.1f} months",
+              delta_color="normal" if curr_idx >= 2 else "inverse")
 
-with col_detail:
-    c1, c2 = st.columns(2)
-    with c1:
-        st.metric("Monthly income",      fmt_money(income))
-        st.metric("Monthly spending",    fmt_money(total_expenditure))
-        surplus_label = "Operating surplus / month" if monthly_surplus >= 0 else "Shortfall each month"
-        st.metric(surplus_label,
-                  fmt_money(abs(monthly_surplus)),
-                  delta="✅ Positive" if monthly_surplus > 0 else ("⚠️ Break-even" if monthly_surplus == 0 else "🚨 Negative"),
-                  delta_color="normal" if monthly_surplus > 0 else "inverse")
-    with c2:
-        st.metric("Emergency fund balance", fmt_money(current_balance))
-        st.metric("Monthly savings set aside", fmt_money(monthly_savings))
-        st.metric("Effective monthly fund growth", fmt_money(effective_surplus))
+st.markdown("<br>", unsafe_allow_html=True)
+
+# ── Row 2: Pie chart + fund growth breakdown ──
+pie_col, bar_col = st.columns([1, 1])
+
+with pie_col:
+    # Build spending breakdown for pie
+    pie_labels, pie_values, pie_colors = [], [], []
+
+    # Essential spending sub-categories (from sidebar variables)
+    expense_items = [
+        ("Housing / Rent",      housing,      "#EF553B"),
+        ("Food & Groceries",    food,         "#FF7F7F"),
+        ("Utilities",           utilities,    "#FFA07A"),
+        ("Transport",           transport,    "#FFB347"),
+        ("Health & Insurance",  health,       "#FFC0CB"),
+        ("Education",           education,    "#FF6B6B"),
+        ("Debt Repayments",     debt,         "#FF4500"),
+        ("Entertainment",       entertainment,"#FFA15A"),
+        ("Household Goods",     household,    "#FFD580"),
+        ("Travel & Holidays",   holidays,     "#FFDAB9"),
+        ("Luxury Items",        luxury,       "#FFE4B5"),
+    ]
+    for label, val, color in expense_items:
+        if val > 0:
+            pie_labels.append(label)
+            pie_values.append(val)
+            pie_colors.append(color)
+
+    # Add savings and surplus as slices
+    if monthly_savings > 0:
+        pie_labels.append("Savings set aside")
+        pie_values.append(monthly_savings)
+        pie_colors.append("#00CC96")
+
+    if monthly_surplus > 0:
+        pie_labels.append("Remaining surplus")
+        pie_values.append(monthly_surplus)
+        pie_colors.append("#636EFA")
+    elif monthly_surplus < 0:
+        # Show deficit as a note — don't add negative slice
+        pass
+
+    if pie_values:
+        fig_pie = go.Figure(go.Pie(
+            labels=pie_labels,
+            values=pie_values,
+            marker_colors=pie_colors,
+            hole=0.45,
+            textinfo="percent",
+            hovertemplate="<b>%{label}</b><br>%{value:,.0f} ₫<br>%{percent}<extra></extra>",
+            sort=False,
+        ))
+        fig_pie.update_layout(
+            title={"text": "Where Your Income Goes", "font": {"size": 14}, "x": 0.5},
+            showlegend=True,
+            legend=dict(orientation="v", font=dict(size=10)),
+            height=320,
+            margin=dict(t=40, b=10, l=0, r=0),
+            annotations=[dict(
+                text=f"<b>{(total_expenditure/income*100):.0f}%</b><br>spent" if income > 0 else "spending",
+                x=0.5, y=0.5, font_size=14, showarrow=False
+            )]
+        )
+        st.plotly_chart(fig_pie, use_container_width=True)
+        if monthly_surplus < 0:
+            st.caption(f"⚠️ Spending exceeds income by {fmt_money(abs(monthly_surplus))}/month — deficit not shown in chart.")
+
+with bar_col:
+    # Fund growth breakdown bar
+    st.markdown("**📈 Your Monthly Fund Growth**")
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    growth_items = [
+        ("Income after expenses", monthly_surplus, "#636EFA" if monthly_surplus >= 0 else "#EF553B"),
+        ("Dedicated savings",     monthly_savings,  "#00CC96"),
+    ]
+    for label, val, color in growth_items:
+        pct = abs(val) / income * 100 if income > 0 else 0
+        bar_width = min(pct, 100)
+        sign = "+" if val >= 0 else "−"
+        bar_color = color if val >= 0 else "#EF553B"
+        st.markdown(f"""
+        <div style="margin-bottom:14px;">
+            <div style="display:flex; justify-content:space-between; font-size:0.88rem; margin-bottom:4px;">
+                <span style="color:#444;">{label}</span>
+                <span style="font-weight:600; color:{bar_color};">{sign}{fmt_money(abs(val))}</span>
+            </div>
+            <div style="background:#eee; border-radius:4px; height:10px;">
+                <div style="width:{bar_width:.1f}%; background:{bar_color}; height:10px; border-radius:4px;"></div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    total_color = "#00CC96" if effective_surplus > 0 else "#EF553B"
+    total_sign  = "+" if effective_surplus >= 0 else "−"
+    st.markdown(f"""
+    <div style="background:#f8f8f8; border-radius:8px; padding:14px; border-left:4px solid {total_color};">
+        <div style="font-size:0.85rem; color:#666;">Total fund grows by / month</div>
+        <div style="font-size:1.5rem; font-weight:700; color:{total_color};">
+            {total_sign}{fmt_money(abs(effective_surplus))}
+        </div>
+        <div style="font-size:0.8rem; color:#888; margin-top:4px;">
+            At this rate your fund gains <b>1 month of coverage</b> every
+            <b>{"%.1f months" % (total_expenditure / effective_surplus) if effective_surplus > 0 else "∞"}</b>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 2 — CAN YOU SURVIVE YOUR SCENARIO?
