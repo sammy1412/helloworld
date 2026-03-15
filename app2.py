@@ -715,25 +715,43 @@ if monthly_savings > 0 or current_balance > 0:
         labels={"Balance": "Fund Balance", "Month": "Month from now"}
     )
 
-    # Add coverage lines
-    for months_cov, label_text, color in [
-        (1, "1 month covered",  "#FFA15A"),
-        (3, "3 months covered", "#636EFA"),
-        (6, "6 months covered", "#00CC96"),
-    ]:
+    # Add coverage threshold lines with staggered left-side labels to avoid overlap
+    threshold_lines = [
+        (1, "① 1 month",  "#FFA15A", "top left"),
+        (3, "② 3 months", "#636EFA", "top left"),
+        (6, "③ 6 months", "#00CC96", "top left"),
+    ]
+    for months_cov, label_text, color, _ in threshold_lines:
+        y_val = months_cov * total_expenditure
         fig_proj.add_hline(
-            y=months_cov * total_expenditure,
-            line_dash="dash", line_color=color,
-            annotation_text=label_text,
-            annotation_position="right"
+            y=y_val,
+            line_dash="dash",
+            line_color=color,
+            line_width=1.5,
+            annotation=dict(
+                text=f"<b>{label_text}</b>",
+                font=dict(color=color, size=11),
+                bgcolor="white",
+                bordercolor=color,
+                borderwidth=1,
+                borderpad=3,
+                x=0.01,          # anchor to left side (0=left, 1=right)
+                xanchor="left",
+            ),
+            annotation_position="top left",
         )
 
     fig_proj.update_layout(
-        yaxis_title="Fund Balance",
+        yaxis_title="Fund Balance (₫)",
         xaxis_title="Month from now",
-        height=350,
-        legend_title="Financial State"
+        height=400,
+        legend_title="Financial State",
+        legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="left", x=0),
+        margin=dict(t=50, b=80, l=60, r=20),
+        hovermode="x unified",
     )
+    # Format y-axis ticks as compact numbers
+    fig_proj.update_yaxes(tickformat=".2s")
     st.plotly_chart(fig_proj, use_container_width=True)
 
     # Milestone callouts
@@ -745,14 +763,31 @@ if monthly_savings > 0 or current_balance > 0:
                 milestones[target] = row["Month"]
 
     m1, m2, m3 = st.columns(3)
+    milestone_colors = {1: "#FFA15A", 3: "#636EFA", 6: "#00CC96"}
     for col, (target, month_reached) in zip([m1, m2, m3], milestones.items()):
+        color = milestone_colors[target]
         with col:
             if month_reached is not None:
                 if month_reached == 0:
-                    col.metric(f"{target}-month coverage", "Already there ✅")
+                    col.markdown(f"""
+                    <div style="border:2px solid {color}; border-radius:8px; padding:14px; text-align:center;">
+                        <div style="font-size:0.85rem; color:#555; margin-bottom:6px;">{target}-month coverage</div>
+                        <div style="font-size:1.2rem; font-weight:700; color:{color};">✅ Already there</div>
+                    </div>""", unsafe_allow_html=True)
                 else:
-                    col.metric(f"{target}-month coverage", f"Month {month_reached}", f"≈ {month_reached/12:.1f} years")
+                    years_str = f"≈ {month_reached/12:.1f} yrs" if month_reached >= 12 else f"{month_reached} months away"
+                    col.markdown(f"""
+                    <div style="border:2px solid {color}; border-radius:8px; padding:14px; text-align:center;">
+                        <div style="font-size:0.85rem; color:#555; margin-bottom:6px;">{target}-month coverage</div>
+                        <div style="font-size:1.4rem; font-weight:700; color:{color};">Month {month_reached}</div>
+                        <div style="font-size:0.8rem; color:#888; margin-top:4px;">{years_str}</div>
+                    </div>""", unsafe_allow_html=True)
             else:
-                col.metric(f"{target}-month coverage", "Not reached in 3 years", delta="Save more", delta_color="inverse")
+                col.markdown(f"""
+                <div style="border:2px dashed #ccc; border-radius:8px; padding:14px; text-align:center;">
+                    <div style="font-size:0.85rem; color:#555; margin-bottom:6px;">{target}-month coverage</div>
+                    <div style="font-size:1.1rem; font-weight:700; color:#EF553B;">Not reached in 3 years</div>
+                    <div style="font-size:0.8rem; color:#888; margin-top:4px;">💡 Save more to get here</div>
+                </div>""", unsafe_allow_html=True)
 else:
     st.info("Enter a savings amount or current balance to see your fund growth projection.")
